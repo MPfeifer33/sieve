@@ -7,6 +7,29 @@ use crate::history;
 use crate::imports;
 use crate::SieveError;
 
+/// Sentinel's risk level for a file (loaded from .agent-sentinel/matrix.json)
+#[derive(Debug, Deserialize)]
+struct SentinelMatrix {
+    files: Vec<SentinelFileRisk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SentinelFileRisk {
+    path: String,
+    risk_score: u32,
+    level: String,
+    bugfix_commits: usize,
+    related_tests: Vec<SentinelRelatedTest>,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SentinelRelatedTest {
+    path: String,
+    #[allow(dead_code)]
+    cochanges: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AnalysisResult {
     pub changed_files: Vec<String>,
@@ -120,7 +143,54 @@ pub fn run_analysis(
         }
     }
 
-    // Signal 5: Fallback project-level command (low confidence)
+    // Signal 5: Sentinel fragility matrix (high confidence)
+    if let Some(matrix) = load_sentinel_matrix(repo) {
+        for file in changed_files {
+            if is_test_file(file, primary_kind) {
+                continue;
+            }
+            if let Some(risk) = matrix.files.iter().find(|f| f.path == *file) {
+                if risk.level == "high" || risk.level == "medium" {
+                    // Add signals for sentinel's related tests
+                    for related in &risk.related_tests {
+                        if signals.iter().any(|s| {
+                            s.changed_file == *file && s.test_file.as_deref() == Some(related.path.as_str())
+                        }) {
+                            continue; // Already found by other signals
+                        }
+                        signals.push(Signal {
+                            kind: "sentinel_risk".into(),
+                            changed_file: file.clone(),
+                            test_file: Some(related.path.clone()),
+                            command: test_command_for_file(&related.path, primary_kind),
+                            confidence: if risk.level == "high" { "certain" } else { "high" }.into(),
+                            reason: format!(
+                                "Sentinel risk {} (score {}, {} bugfix commits): {}",
+                                risk.level, risk.risk_score, risk.bugfix_commits,
+                                risk.reasons.first().map(|s| s.as_str()).unwrap_or("fragile file")
+                            ),
+                        });
+                    }
+                    // If sentinel knows the file is risky but has no related tests, promote to full suite
+                    if risk.related_tests.is_empty() && !signals.iter().any(|s| s.changed_file == *file) {
+                        signals.push(Signal {
+                            kind: "sentinel_risk".into(),
+                            changed_file: file.clone(),
+                            test_file: None,
+                            command: projects.first().and_then(|p| detect::test_command_for(p)),
+                            confidence: if risk.level == "high" { "certain" } else { "high" }.into(),
+                            reason: format!(
+                                "Sentinel risk {} (score {}) — full test suite recommended",
+                                risk.level, risk.risk_score
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Signal 6: Fallback project-level command (low confidence)
     if signals.is_empty() {
         for project in projects {
             if let Some(cmd) = detect::test_command_for(project) {
@@ -178,6 +248,12 @@ fn extract_module_name(file: &str, kind: &str) -> Option<String> {
         "go" => Some(stem.to_string()),
         _ => None,
     }
+}
+
+fn load_sentinel_matrix(repo: &Path) -> Option<SentinelMatrix> {
+    let path = repo.join(".agent-sentinel").join("matrix.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 fn test_command_for_file(file: &str, kind: &str) -> Option<String> {
