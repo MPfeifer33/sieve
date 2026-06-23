@@ -108,6 +108,72 @@ fn fallback_recommendation_reports_coverage_gap() {
 }
 
 #[test]
+fn atlas_rdep_surfaces_test_from_dependency_graph() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    rust_project(dir);
+    // Source file — named so convention and import matching won't find the test
+    fs::write(dir.join("src/core.rs"), "pub fn run() {}\n").unwrap();
+    // A test file with a non-matching name that only atlas knows depends on core.rs
+    fs::write(
+        dir.join("tests/smoke.rs"),
+        "#[test] fn it_runs() {}\n",
+    )
+    .unwrap();
+
+    // Write an atlas graph where tests/smoke.rs depends on src/core.rs
+    let atlas_dir = dir.join(".agent-atlas");
+    fs::create_dir_all(&atlas_dir).unwrap();
+    fs::write(
+        atlas_dir.join("graph.json"),
+        r#"{
+            "nodes": {
+                "src/core.rs": {
+                    "path": "src/core.rs",
+                    "language": "rust",
+                    "imports": [],
+                    "deps": [],
+                    "exports": ["run"],
+                    "lines": 1
+                },
+                "tests/smoke.rs": {
+                    "path": "tests/smoke.rs",
+                    "language": "rust",
+                    "imports": [],
+                    "deps": ["src/core.rs"],
+                    "exports": [],
+                    "lines": 1
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let json = json_output(
+        sieve(dir)
+            .args(["--format", "json", "analyze", "--file", "src/core.rs"])
+            .output()
+            .unwrap(),
+        "atlas rdep analyze",
+    );
+
+    assert_eq!(json["ok"], true);
+    // Should have an atlas_rdep signal (not found by convention or import matching)
+    let signals = json["signals"].as_array().unwrap();
+    let atlas_signal = signals
+        .iter()
+        .find(|s| s["kind"] == "atlas_rdep");
+    assert!(
+        atlas_signal.is_some(),
+        "Expected atlas_rdep signal, got: {signals:?}"
+    );
+    let sig = atlas_signal.unwrap();
+    assert_eq!(sig["changed_file"], "src/core.rs");
+    assert_eq!(sig["test_file"], "tests/smoke.rs");
+    assert_eq!(sig["confidence"], "high");
+}
+
+#[test]
 fn text_output_highlights_recommendations_and_full_validation() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();

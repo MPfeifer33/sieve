@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +13,21 @@ use crate::SieveError;
 struct SentinelMatrix {
     files: Vec<SentinelFileRisk>,
 }
+
+/// Minimal atlas graph structs — only what we need to build rdeps.
+/// Atlas serializes `rdeps` with `#[serde(skip)]`, so we rebuild from forward deps.
+#[derive(Debug, Deserialize)]
+struct AtlasGraph {
+    nodes: HashMap<String, AtlasNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AtlasNode {
+    deps: Vec<String>,
+}
+
+/// Max atlas-sourced signals to prevent noise on hub files.
+const ATLAS_SIGNAL_CAP: usize = 10;
 
 #[derive(Debug, Deserialize)]
 struct SentinelFileRisk {
@@ -190,7 +206,46 @@ pub fn run_analysis(
         }
     }
 
-    // Signal 6: Fallback project-level command (low confidence)
+    // Signal 6: Atlas reverse dependencies (high confidence)
+    if let Some(rdeps_map) = load_atlas_rdeps(repo) {
+        let mut atlas_signal_count = 0;
+        for file in changed_files {
+            if atlas_signal_count >= ATLAS_SIGNAL_CAP {
+                break;
+            }
+            if is_test_file(file, primary_kind) {
+                continue;
+            }
+            let normalized = normalize_path(file);
+            if let Some(dependents) = rdeps_map.get(&normalized) {
+                for dep in dependents {
+                    if atlas_signal_count >= ATLAS_SIGNAL_CAP {
+                        break;
+                    }
+                    if !is_test_file(dep, primary_kind) {
+                        continue; // Only surface test files
+                    }
+                    // Skip if already found by other signals
+                    if signals.iter().any(|s| {
+                        s.changed_file == *file && s.test_file.as_deref() == Some(dep.as_str())
+                    }) {
+                        continue;
+                    }
+                    signals.push(Signal {
+                        kind: "atlas_rdep".into(),
+                        changed_file: file.clone(),
+                        test_file: Some(dep.clone()),
+                        command: test_command_for_file(dep, primary_kind),
+                        confidence: "high".into(),
+                        reason: format!("Atlas: test file depends on changed file"),
+                    });
+                    atlas_signal_count += 1;
+                }
+            }
+        }
+    }
+
+    // Signal 7: Fallback project-level command (low confidence)
     if signals.is_empty() {
         for project in projects {
             if let Some(cmd) = detect::test_command_for(project) {
@@ -248,6 +303,38 @@ fn extract_module_name(file: &str, kind: &str) -> Option<String> {
         "go" => Some(stem.to_string()),
         _ => None,
     }
+}
+
+/// Normalize a file path for comparison: strip leading `./`, use forward slashes.
+fn normalize_path(path: &str) -> String {
+    let p = path.strip_prefix("./").unwrap_or(path);
+    p.replace('\\', "/")
+}
+
+/// Load atlas graph and build reverse dependency map.
+/// Returns None silently if graph doesn't exist or can't be parsed.
+fn load_atlas_rdeps(repo: &Path) -> Option<HashMap<String, Vec<String>>> {
+    let path = repo.join(".agent-atlas").join("graph.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let graph: AtlasGraph = serde_json::from_str(&content).ok()?;
+
+    let mut rdeps: HashMap<String, Vec<String>> = HashMap::new();
+    for (file_path, node) in &graph.nodes {
+        let normalized_source = normalize_path(file_path);
+        for dep in &node.deps {
+            let normalized_dep = normalize_path(dep);
+            // Skip self-edges
+            if normalized_dep == normalized_source {
+                continue;
+            }
+            rdeps
+                .entry(normalized_dep)
+                .or_default()
+                .push(normalized_source.clone());
+        }
+    }
+
+    Some(rdeps)
 }
 
 fn load_sentinel_matrix(repo: &Path) -> Option<SentinelMatrix> {
